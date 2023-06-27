@@ -43,4 +43,16 @@ func main() {
 
 	//创建controller
 	controller := NewController(ctx, kubeClient, kubeInformerFactory.Core().V1().Services())
+
+	kubeInformerFactory.Start(ctx.Done())
+
+	if err = controller.Run(ctx, 2); err != nil {
+		logger.Error(err, "Error running controller")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
+}
+
+func init() {
+	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
 }
