@@ -6,6 +6,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	v1 "k8s.io/client-go/informers/core/v1"
@@ -17,10 +19,21 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
+	"reflect"
 	"time"
 )
 
 const controllerAgentName = "service-controller"
+
+// Service 定义一个Service结构体
+type Service struct {
+	Name      string
+	Namespace string
+	Selector  map[string]string
+}
+
+// 定义一个Map用于存储pre service
+var preServices map[string]Service
 
 type Controller struct {
 	// kubeclientset is a standard kubernetes clientset
@@ -59,13 +72,58 @@ func NewController(ctx context.Context, kubeclientset kubernetes.Interface, serv
 	// 用于处理k8s api服务器上的资源事件，每当有资源发生变化时，注册的事件处理函数就会被调用
 	// 将资源变化转换成待处理的任务，相当于生产者。因此只需要在此处入队，而不需要做逻辑操作
 	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.enqueueSvc,
+		AddFunc: func(obj interface{}) {
+			controller.addService(controller, obj)
+		},
 		UpdateFunc: func(old, new interface{}) {
 			controller.enqueueSvc(new)
 		},
 		DeleteFunc: controller.enqueueSvc,
 	})
 	return controller
+}
+
+func (c *Controller) addService(controller *Controller, obj interface{}) {
+	service, err := controller.convertToService(obj)
+	if err != nil {
+		return
+	}
+	preServices[service.Name] = service
+	controller.enqueueSvc(obj)
+	fmt.Printf("Add service: %s/%s\n", service.Namespace, service.Name)
+}
+
+func (c *Controller) deleteService(controller Controller, obj interface{}) {
+	service, err := controller.convertToService(obj)
+	if err != nil {
+		return
+	}
+	// 从 preServices 中删除 Service 对象
+	delete(preServices, service.Name)
+	controller.enqueueSvc(obj)
+	fmt.Printf("Delete service: %s/%s\n", service.Namespace, service.Name)
+}
+
+// 将obj转化为service对象
+func (c *Controller) convertToService(obj interface{}) (Service, error) {
+	// 将obj转化为runtime.Object对象
+	ro, ok := obj.(runtime.Object)
+	if !ok {
+		return Service{}, fmt.Errorf("failed to convert to runtime.Object")
+	}
+
+	// 将runtime.object转化为service对象
+	service, ok := ro.(*corev1.Service)
+	if !ok {
+		return Service{}, fmt.Errorf("failed to convert to service")
+	}
+
+	// 构造存储用对象
+	return Service{
+		Name:      service.Name,
+		Namespace: service.Namespace,
+		Selector:  service.Spec.Selector,
+	}, nil
 }
 
 // Run 定义controller类型的方法
@@ -173,25 +231,55 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		}
 		return err
 	}
-	// 通过client检查Service是否存在对应的endpoint
-	// 如果该Service有Endpoints则打印所有EndPoints信息
-	// 当一个Service没有endpoints时，它仍然具有一个Cluster IP地址，但是该地址将为空字符串。在这种情况下，service.Spec.ClusterIP的长度将等于0。通常，没有endpoints的Service通常用于在集群内部使用，会使用DNS发现机制与内部pod进行路由，而不需要通过Kubernetes Service进行路由
-	if len(svc.Spec.ClusterIP) > 0 {
-		endpoints, err := c.kubeclientset.CoreV1().Endpoints(namespace).Get(ctx, name, metav1.GetOptions{})
+
+	// 通过deletionTimestamp字段判断是否是del操作， 若是Del，则删除service名下的所有pods
+	if svc.GetObjectMeta().GetDeletionTimestamp() != nil {
+		// 获取svc的所有selector标签
+		selector := &metav1.LabelSelector{MatchLabels: svc.Spec.Selector}
+		selectorLabel, err := metav1.LabelSelectorAsSelector(selector)
 		if err != nil {
-			utilruntime.HandleError(fmt.Errorf("get Service's endpoints '#{name}' failed"))
 			return err
 		}
-		fmt.Printf("Endpoints for %s:\n", name)
-		for _, subset := range endpoints.Subsets {
-			for _, address := range subset.Addresses {
-				fmt.Printf("\tIP: %s\n", address.IP)
-			}
-			for _, port := range subset.Ports {
-				fmt.Printf("\tPort: %d\n", port.Port)
+		// 根据selector标签获取相关的pod对象
+		podList, err := c.kubeclientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: selectorLabel.String()})
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("get Service: '#{name}' pods failed"))
+		}
+		// 删除所有相关的pod对象
+		for _, pod := range podList.Items {
+			err = c.kubeclientset.CoreV1().Pods(namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("delete Service: '#{name}' pods failed"))
 			}
 		}
-	} else { // 如果该Service没有Endpoints则创建Pod， 要求pod的label与svc的selector相同
+		// 进行完Del即可返回
+		return nil
+	}
+	// 通过map数据结构将先前的Service存储在内存中，当有新的任务到来时，可以对比当前的Service状态和之前的Service的状态，判断是否需要创建新的Service资源/更新已有资源
+	if preService, ok := preServices[svc.Name]; ok {
+		// preService中已经存在该service， 执行更新操作
+		// 获取原selector并删除对应pods
+		preSelector := preService.Selector
+		if !reflect.DeepEqual(preSelector, svc.Spec.Selector) {
+			err := c.kubeclientset.CoreV1().Pods(namespace).DeleteCollection(ctx, metav1.DeleteOptions{}, metav1.ListOptions{
+				LabelSelector: labels.Set(preSelector).String(),
+			})
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("delete Service: '#{name}' pods for update failed"))
+			}
+			return err
+		}
+
+		// 更新preService中的selector信息
+		delete(preServices, svc.Name)
+		preServices[svc.Name] = Service{
+			Name:      svc.Name,
+			Namespace: svc.Namespace,
+			Selector:  svc.Spec.Selector,
+		}
+
+		// 根据新的selector创建pods
+
 		svcLabel := svc.Labels
 		podName := name + "-pod"
 		_, err := c.kubeclientset.CoreV1().Pods(namespace).Create(ctx, &corev1.Pod{
@@ -227,6 +315,64 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 			return err
 		}
 		logger.Info("create pod: %s for service: %s successes.\n ", pod.Name, svc.Name)
+
+	} else {
+		// preService中不存在此service，则新建pods/打印endpoint信息
+		// 通过client检查Service是否存在对应的endpoint
+		// 如果该Service有Endpoints则打印所有EndPoints信息
+		// 当一个Service没有endpoints时，它仍然具有一个Cluster IP地址，但是该地址将为空字符串。在这种情况下，service.Spec.ClusterIP的长度将等于0。通常，没有endpoints的Service通常用于在集群内部使用，会使用DNS发现机制与内部pod进行路由，而不需要通过Kubernetes Service进行路由
+		if len(svc.Spec.ClusterIP) > 0 {
+			endpoints, err := c.kubeclientset.CoreV1().Endpoints(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("get Service's endpoints '#{name}' failed"))
+				return err
+			}
+			fmt.Printf("Endpoints for %s:\n", name)
+			for _, subset := range endpoints.Subsets {
+				for _, address := range subset.Addresses {
+					fmt.Printf("\tIP: %s\n", address.IP)
+				}
+				for _, port := range subset.Ports {
+					fmt.Printf("\tPort: %d\n", port.Port)
+				}
+			}
+		} else { // 如果该Service没有Endpoints则创建Pod， 要求pod的label与svc的selector相同
+			svcLabel := svc.Labels
+			podName := name + "-pod"
+			_, err := c.kubeclientset.CoreV1().Pods(namespace).Create(ctx, &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   podName,
+					Labels: svcLabel,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "my-container",
+							Image: "nginx",
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: 8080,
+									Protocol:      corev1.ProtocolTCP,
+								},
+							},
+						},
+					},
+				},
+			}, metav1.CreateOptions{})
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("create pods for Srvice: '#{name}' failed"))
+				return err
+			}
+			// wait for the Pod and Service to start up
+			time.Sleep(5 * time.Second)
+			// 检查是否create成功
+			pod, err := c.kubeclientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("create pods for Srvice: '#{name}' failed"))
+				return err
+			}
+			logger.Info("create pod: %s for service: %s successes.\n ", pod.Name, svc.Name)
+		}
 	}
 
 	return nil
