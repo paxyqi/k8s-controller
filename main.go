@@ -1,4 +1,4 @@
-package k8s_controller
+package main 
 
 import (
 	"flag"

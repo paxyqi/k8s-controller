@@ -1,4 +1,4 @@
-package k8s_controller
+package main
 
 import (
 	"context"
@@ -33,7 +33,7 @@ type Service struct {
 }
 
 // 定义一个Map用于存储pre service
-var preServices map[string]Service
+var preServices = make(map[string]Service)
 
 type Controller struct {
 	// kubeclientset is a standard kubernetes clientset
@@ -251,6 +251,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 			if err != nil {
 				utilruntime.HandleError(fmt.Errorf("delete Service: '#{name}' pods failed"))
 			}
+			//TODO
 		}
 		// 进行完Del即可返回
 		return nil
