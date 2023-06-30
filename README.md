@@ -48,4 +48,4 @@ k8s集群本身在service进行修改时，只会处理其名下的endpoints，�
    // 定义一个Map用于存储pre service
    var preServices map[string]Service
    ```
-3. 考虑到服务运行异常，为避免重启丢失将preServices定期持久化到内存中
+3. 考虑到服务运行异常，为避免重启丢失将preServices定期持久化到存储的文件中
